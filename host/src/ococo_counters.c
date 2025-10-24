@@ -26,13 +26,6 @@ extern bool get_no_filter(void);
 /* Global OCOCO counters structure */
 static ococo_counters_t *global_ococo_counters = NULL;
 
-/* DEBUG: Track variant detection statistics */
-static _Atomic uint64_t debug_alignments_processed = 0;
-static _Atomic uint64_t debug_variants_detected = 0;
-static _Atomic uint64_t debug_variants_inserted = 0;
-static _Atomic uint64_t debug_hash_collisions = 0;
-
-
 /* Profiling counters - DISABLED for performance */
 #if 0
 static _Atomic uint64_t profile_counter_updates = 0;
@@ -665,7 +658,6 @@ void ococo_insert_variant(
             entry->alt[MAX_ALLELE_LEN] = '\0';
             atomic_store(&entry->depth, 1);
             atomic_store(&entry->score, score);
-            atomic_fetch_add(&debug_variants_inserted, 1);  /* DEBUG */
 
 #if defined(OCOCO_HYBRID_MODE)
             /* Track this position for fast iteration in VCF generation */
@@ -709,7 +701,6 @@ void ococo_insert_variant(
     }
 
     /* Hash table full for this position (very rare) - drop variant */
-    atomic_fetch_add(&debug_hash_collisions, 1);  /* DEBUG */
 }
 
 void ococo_process_alignment(
@@ -722,8 +713,6 @@ void ococo_process_alignment(
     int code_len,
     int size_read
 ) {
-    atomic_fetch_add(&debug_alignments_processed, 1);  /* DEBUG */
-
     genome_t *genome = genome_get();
     uint64_t seq_offset = genome_pos - genome->pt_seq[seq_nr];
     char nucleotide[4] = {'A', 'C', 'T', 'G'};
@@ -854,7 +843,6 @@ void ococo_process_alignment(
         /* Insert variant (lock-free!) */
 #ifndef OCOCO_LITE_MODE
         if (ref_pos > 0 && alt_pos > 0 && variant_offset < global_ococo_counters->len_seq[seq_nr]) {
-            atomic_fetch_add(&debug_variants_detected, 1);  /* DEBUG */
             ococo_insert_variant(thread_id, seq_nr, variant_offset, ref_str, alt_str, sw_score);
         }
 #endif
@@ -974,13 +962,6 @@ void ococo_create_vcf(const char *vcf_filename) {
     fprintf(stderr, "DEBUG: ococo_create_vcf() ENTRY with filename: %s\n", vcf_filename);
     fflush(stderr);
 
-    /* Read atomic debug counters */
-    uint64_t total_alignments = atomic_load(&debug_alignments_processed);
-    uint64_t total_variants_detected = atomic_load(&debug_variants_detected);
-    uint64_t total_variants_inserted = atomic_load(&debug_variants_inserted);
-    uint64_t total_hash_collisions = atomic_load(&debug_hash_collisions);
-
-    /* CRITICAL: Flush all local buffers before reading counters */
     /* DENSE ARRAY: No buffers to flush, no need to track entry counts */
     fprintf(stderr, "DEBUG: Dense arrays ready for VCF generation (%lu positions × %u threads)\n",
             global_ococo_counters->len_seq[0], global_ococo_counters->num_threads);
