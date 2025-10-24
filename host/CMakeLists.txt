@@ -17,7 +17,10 @@ find_package(OpenMP)
 set(DPU_PROJECT_RELATIVE_PATH ../dpu)
 set(DPU_BINARY_NAME dpu_task)
 set(NR_TASKLETS 16)
-set(CMAKE_C_FLAGS "--std=gnu99 -O3 -Wall -Wextra  -g3 -DNR_TASKLETS=${NR_TASKLETS} -DDPU_BINARY=\\\"${CMAKE_CURRENT_BINARY_DIR}/${DPU_PROJECT_RELATIVE_PATH}/${DPU_BINARY_NAME}\\\"")
+set(CMAKE_C_FLAGS "--std=gnu99 -O3 -march=native -flto -Wall -Wextra  -g3 -DNR_TASKLETS=${NR_TASKLETS} -DDPU_BINARY=\\\"${CMAKE_CURRENT_BINARY_DIR}/${DPU_PROJECT_RELATIVE_PATH}/${DPU_BINARY_NAME}\\\"")
+
+# Enable LTO for linker
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
 
 # Add OpenMP flags if available
 if(OPENMP_FOUND)
