@@ -62,14 +62,17 @@ void dout_init(unsigned int tid, dout_t *dout);
 /**
  * @brief Records a new result
  *
- * @param dout     Data output.
- * @param num      Request number.
- * @param score    Recorded scored.
- * @param seed_nr  Recorded seed number.
- * @param seq_nr   Recorded sequence number.
- * @param stats    To update statistical report.
+ * @param dout       Data output.
+ * @param num        Request number.
+ * @param score      Recorded scored.
+ * @param seed_nr    Recorded seed number.
+ * @param seq_nr     Recorded sequence number.
+ * @param cigar_ops  CIGAR operations array (can be NULL for no CIGAR)
+ * @param cigar_len  Number of CIGAR operations (0 = no CIGAR)
+ * @param stats      To update statistical report.
  */
-void dout_add(dout_t *dout, uint32_t num, unsigned int score, uint32_t seed_nr, uint32_t seq_nr, dpu_tasklet_stats_t *stats);
+void dout_add(dout_t *dout, uint32_t num, unsigned int score, uint32_t seed_nr, uint32_t seq_nr,
+              uint8_t *cigar_ops, uint8_t cigar_len, dpu_tasklet_stats_t *stats);
 
 /**
  * @brief locates a swap page for a given data out structure.

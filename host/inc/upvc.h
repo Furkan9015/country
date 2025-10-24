@@ -16,6 +16,13 @@
 #define COST_GAPE 1
 #define NB_DIAG 15
 
+// Backtrack structure for alignment - shared across implementations
+typedef struct backtrack_s {
+    int type;  // 0=match, 1=substitution, 2=insertion, 3=deletion
+    int ix;    // Position in reference
+    int jx;    // Position in read
+} backtrack_t;
+
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>

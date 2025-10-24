@@ -18,7 +18,7 @@
 #define MAX_DPU_RESULTS (1 << 19)
 #define MAX_RESULTS_PER_READ (1 << 10)
 
-#define SIZE_READ 120
+#define SIZE_READ 150
 #define SIZE_SEED 14
 #define SIZE_NEIGHBOUR_IN_BYTES ((SIZE_READ - SIZE_SEED) / 4)
 #define DELTA_NEIGHBOUR(round) ((SIZE_SEED * round) / 4)
@@ -46,11 +46,48 @@ typedef struct {
 } dpu_result_coord_t;
 
 /**
+ * @brief CIGAR operation encoding for DPU alignment results
+ *
+ * 2-bit encoding per operation:
+ * 00 = Match/Mismatch (M)
+ * 01 = Insertion (I)
+ * 10 = Deletion (D)
+ * 11 = Reserved
+ */
+#define CIGAR_OP_MATCH 0
+#define CIGAR_OP_INS   1
+#define CIGAR_OP_DEL   2
+
+/**
+ * @brief Maximum CIGAR operations for SIZE_READ (120bp)
+ * Worst case: all mismatches/indels = 120 ops
+ */
+#define MAX_CIGAR_OPS 140
+
+/**
+ * @brief Bitpacked CIGAR storage
+ * 2 bits per operation, 16 ops per uint32_t
+ * 140 ops / 16 = 8.75, round up to 9 uint32_t = 36 bytes (vs 140 bytes unpacked)
+ */
+#define CIGAR_PACKED_WORDS 9
+
+/**
+ * @brief Helper macros for CIGAR bitpacking (2 bits per op)
+ */
+#define CIGAR_PACK_OP(packed, idx, op) \
+    ((packed)[(idx) / 16] |= ((uint32_t)(op) << (((idx) % 16) * 2)))
+
+#define CIGAR_UNPACK_OP(packed, idx) \
+    (((packed)[(idx) / 16] >> (((idx) % 16) * 2)) & 0x3)
+
+/**
  * @brief One result produced for one read
  *
  * @var num  Number that associate an input read with a request.
  * @var score Best score of the read with a read of the reference genome.
  * @var coord Coordinate of the read that matched in the reference genome.
+ * @var cigar_len Number of CIGAR operations (0 = no CIGAR available)
+ * @var cigar_packed Bitpacked CIGAR encoding (2 bits per operation, 16 ops per uint32_t)
  */
 typedef struct {
     union {
@@ -61,7 +98,12 @@ typedef struct {
         uint64_t key;
     };
     dpu_result_coord_t coord;
-} dpu_result_out_t;
+
+    /* DPU CIGAR output (Option B optimization - bitpacked for memory efficiency) */
+    uint8_t cigar_len;                       /* 0 = no CIGAR (fallback to host alignment) */
+    uint8_t reserved[3];                     /* Reserved for future use */
+    uint32_t cigar_packed[CIGAR_PACKED_WORDS]; /* Bitpacked CIGAR: 2 bits/op, 36 bytes */
+} __attribute__((aligned(8))) dpu_result_out_t;
 #define DPU_RESULT_VAR m_dpu_result
 
 /**

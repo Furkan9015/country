@@ -25,7 +25,8 @@ void dout_init(unsigned int tid, dout_t *dout)
     dout_clear(dout);
 }
 
-void dout_add(dout_t *dout, uint32_t num, unsigned int score, uint32_t seed_nr, uint32_t seq_nr, dpu_tasklet_stats_t *stats)
+void dout_add(dout_t *dout, uint32_t num, unsigned int score, uint32_t seed_nr, uint32_t seq_nr,
+              uint8_t *cigar_ops, uint8_t cigar_len, dpu_tasklet_stats_t *stats)
 {
     dpu_result_out_t *new_out;
     if (dout->nb_cached_out == MAX_LOCAL_RESULTS_PER_READ) {
@@ -49,6 +50,23 @@ void dout_add(dout_t *dout, uint32_t num, unsigned int score, uint32_t seed_nr, 
     new_out->score = score;
     new_out->coord.seed_nr = seed_nr;
     new_out->coord.seq_nr = seq_nr;
+
+    /* Pack CIGAR data if available (bitpacked: 2 bits per op) */
+    if (cigar_ops != NULL && cigar_len > 0 && cigar_len <= MAX_CIGAR_OPS) {
+        new_out->cigar_len = cigar_len;
+
+        /* Clear packed array first */
+        for (uint8_t i = 0; i < CIGAR_PACKED_WORDS; i++) {
+            new_out->cigar_packed[i] = 0;
+        }
+
+        /* Pack operations: 2 bits each, 16 ops per uint32_t */
+        for (uint8_t i = 0; i < cigar_len; i++) {
+            CIGAR_PACK_OP(new_out->cigar_packed, i, cigar_ops[i]);
+        }
+    } else {
+        new_out->cigar_len = 0;  /* No CIGAR available */
+    }
 
     dout->nb_cached_out++;
     dout->nb_results++;

@@ -6,8 +6,8 @@
 # EDIT THESE TWO VARIABLES TO POINT TO THE PROPER BINARIES FOR VCF2DIPLOID AND ART_ILLUMINA
 # You can obtain VCF2Diploid from github.com/moselhy/vcf2diploid, you need to run "make" after you clone it to create the jar file
 # You can obtain ART from https://www.niehs.nih.gov/research/resources/software/biostatistics/art/index.cfm, you just need to untar the binary package
-VCF2DIPLOID="/home/ubuntu/work/genomee/vcf2diploid/vcf2diploid.jar"
-ART_ILLUMINA="/home/ubuntu/work/genomee/art_bin_MountRainier/art_illumina"
+VCF2DIPLOID="/home/furkane/vcf2diploid/vcf2diploid.jar"
+ART_ILLUMINA="/home/furkane/vcf2diploid/art_bin_MountRainier/art_illumina"
 
 # add in the $HOME/.bash_profile
 # PATH="/Users/lavenier/Documents/Projets/UPMEM/upvc1.4/VCScripts:${PATH}"
@@ -47,7 +47,7 @@ fi
 # Filter the chromosomes even more by choosing one out of 10 that are not in weak-spots of the reference genome
 if [ ! -f "chrallvars_filtered.vcf" ]; then
         echo "Select variants"
-	sel_var.py "chrall.fasta" "chrallvars.vcf" "chrallvars_filtered.vcf" "${seed}"
+	./sel_var.py "chrall.fasta" "chrallvars.vcf" "chrallvars_filtered.vcf" "${seed}"
 fi
 
 # Split the reference genome into paternal/maternal chromosomes and insert the variants into them

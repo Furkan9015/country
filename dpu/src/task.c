@@ -22,6 +22,10 @@
 
 #include "common.h"
 
+#ifdef USE_DPU_COUNTERS
+#include "mram_counters.h"
+#endif
+
 BARRIER_INIT(init_barrier, NR_TASKLETS);
 
 STDOUT_BUFFER_INIT(128 * 1024);
@@ -111,6 +115,8 @@ static void compare_neighbours(sysname_t tasklet_id, uint32_t *mini, coords_and_
 {
     uint32_t score, score_nodp, score_odpd = UINT_MAX;
     uint8_t *ref_nbr = &cached_coords_and_nbr->nbr[0];
+    uint8_t cigar_ops[MAX_CIGAR_OPS];
+    uint8_t cigar_len = 0;
     STATS_TIME_VAR(start, end, acc);
 
     STATS_GET_START_TIME(start, acc, end);
@@ -124,11 +130,27 @@ static void compare_neighbours(sysname_t tasklet_id, uint32_t *mini, coords_and_
     if (score_nodp == UINT_MAX) {
         STATS_GET_START_TIME(start, acc, end);
 
-        score_odpd = score = odpd(current_read_nbr, ref_nbr, *mini, NB_BYTES_TO_SYMS(SIZE_NEIGHBOUR_IN_BYTES, DPU_MRAM_INFO_VAR));
+        /* Use CIGAR-enabled version for Option B optimization */
+        score_odpd = score = odpd_with_cigar(current_read_nbr, ref_nbr, *mini,
+                                              NB_BYTES_TO_SYMS(SIZE_NEIGHBOUR_IN_BYTES, DPU_MRAM_INFO_VAR),
+                                              cigar_ops, &cigar_len);
 
         STATS_GET_END_TIME(end, acc);
         STATS_STORE_ODPD_TIME(tasklet_stats, (end + acc - start));
         STATS_INCR_NB_ODPD_CALLS(*tasklet_stats);
+
+#ifdef USE_DPU_COUNTERS
+        /* Stage 2: Update MRAM counters from alignment CIGAR */
+        if (cigar_len > 0 && score <= *mini) {
+            mram_update_counters_from_cigar(
+                cigar_ops,
+                cigar_len,
+                cached_coords_and_nbr->coord.seed_nr,  /* ref offset in genome */
+                current_read_nbr,
+                tasklet_stats
+            );
+        }
+#endif
     }
 
     if (score > *mini) {
@@ -148,7 +170,7 @@ static void compare_neighbours(sysname_t tasklet_id, uint32_t *mini, coords_and_
     }
 
     dout_add(dout, request->num, (unsigned int)score, cached_coords_and_nbr->coord.seed_nr, cached_coords_and_nbr->coord.seq_nr,
-        tasklet_stats);
+        cigar_ops, cigar_len, tasklet_stats);
 }
 
 static void compute_request(sysname_t tasklet_id, coords_and_nbr_t *cached_coords_and_nbr, uint8_t *current_read_nbr,
@@ -230,6 +252,14 @@ int main()
 
         request_pool_init();
         result_pool_init();
+
+#ifdef USE_DPU_COUNTERS
+        /* Stage 2: Initialize MRAM counter array
+         * TODO: Get actual genome slice size from host
+         * For prototype, using fixed size (64K positions)
+         */
+        mram_counters_init(64 * 1024);
+#endif
 
         if (((NB_BYTES_TO_SYMS(SIZE_NEIGHBOUR_IN_BYTES, DPU_MRAM_INFO_VAR) + 2) * 3 * 16) >= 0x10000) {
             printf("cannot run code: symbol length is larger than mulub operation\n");

@@ -24,6 +24,10 @@
 
 #include "backends_functions.h"
 
+#ifdef USE_OCOCO_COUNTERS
+#include "ococo_counters.h"
+#endif
+
 unsigned int nb_dpus_per_run;
 
 static backends_functions_t backends_functions;
@@ -274,7 +278,23 @@ static void exec_round()
 static void do_mapping()
 {
     backends_functions.init_backend(&nb_dpus_per_run);
+
+#ifdef USE_OCOCO_COUNTERS
+    /* OCOCO counter-based variant calling */
+#if defined(OCOCO_LITE_MODE)
+    printf("Using OCOCO counter-based variant calling (Stage 2 Lite - No Hash Tables)\n");
+#elif defined(OCOCO_HYBRID_MODE)
+    printf("Using OCOCO counter-based variant calling (Stage 2.5 Hybrid - Hash Tables + Counter Evidence)\n");
+#else
+    printf("Using OCOCO counter-based variant calling (Stage 1 - With Hash Tables)\n");
+#endif
+    ococo_counters_init(8);  /* 8 processing threads */
+    ococo_init_reference_bases();  /* Initialize OCOCO ref bases after counters are initialized */
+#else
+    /* Traditional variant tree */
     variant_tree_init();
+#endif
+
     dispatch_init();
     process_read_init();
 
@@ -285,11 +305,22 @@ static void do_mapping()
             round);
         exec_round();
     }
+
+#ifdef USE_OCOCO_COUNTERS
+    /* Generate VCF from OCOCO counters */
+    char vcf_filename[1024];
+    sprintf(vcf_filename, "%s_upvc_ococo.vcf", get_input_path());
+    ococo_create_vcf(vcf_filename);
+    ococo_print_stats();
+    ococo_counters_free();
+#else
+    /* Traditional VCF generation */
     create_vcf();
+    variant_tree_free();
+#endif
 
     process_read_free();
     dispatch_free();
-    variant_tree_free();
     backends_functions.free_backend();
 }
 
@@ -341,7 +372,9 @@ int main(int argc, char *argv[])
         index_create();
         break;
     case goal_map:
+        fprintf(stderr, "DEBUG: Before genome_load, input_path='%s'\n", get_input_path());
         genome_load();
+        fprintf(stderr, "DEBUG: After genome_load, input_path='%s'\n", get_input_path());
         index_load();
         do_mapping();
         break;

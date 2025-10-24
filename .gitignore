@@ -1,4 +1,6 @@
 build
 cmake-build-debug/
 *.log
-.idea
+.ideaexternal/WFA2-lib/
+ococo/
+sequila/

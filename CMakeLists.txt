@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.10)   # safer than 3.5 now
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

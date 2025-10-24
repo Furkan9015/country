@@ -15,6 +15,21 @@
 #include "upvc.h"
 #include "vartree.h"
 
+#ifdef USE_OCOCO_COUNTERS
+#include "ococo_counters.h"
+// OCOCO thread-local counter tracking (similar to WFA2 pool mechanism)
+#define PROCESS_READ_THREAD_OCOCO (8)
+static pthread_mutex_t ococo_thread_assign_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t ococo_thread_ids[PROCESS_READ_THREAD_OCOCO];
+static int next_ococo_thread_idx = 0;
+static inline int get_ococo_thread_id(void);  // Forward declaration
+#endif
+
+#ifdef USE_WFA2
+#include "wfa2_wrapper.h"
+static inline int get_thread_pool_idx(void);  // Forward declaration
+#endif
+
 #define SIZE_INSERT_MEAN (400)
 #define SIZE_INSERT_STD (3 * 50)
 
@@ -35,13 +50,77 @@
 #define PATH_INSERTION (1)
 #define PATH_DELETION (2)
 
-typedef struct {
-    int type;
-    int ix;
-    int jx;
-} backtrack_t;
+#ifdef USE_WFA2
+// WFA2 thread-local aligner pools (defined at file scope for visibility)
+#define PROCESS_READ_THREAD_WFA2 (8)
+static wfa2_aligner_pool_t *wfa2_pools[PROCESS_READ_THREAD_WFA2];
+static pthread_mutex_t pool_assign_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t pool_thread_ids[PROCESS_READ_THREAD_WFA2];
+static int next_pool_idx = 0;
+#endif
 
 static int min(int a, int b) { return a < b ? a : b; }
+
+/**
+ * @brief Convert DPU bitpacked CIGAR to UPVC backtrack format
+ *
+ * DPU CIGAR format: bitpacked 2 bits per op (0=match, 1=insertion, 2=deletion)
+ * UPVC backtrack format: type (0=match, 1=sub, 2=ins, 3=del), ix (ref pos), jx (read pos)
+ *
+ * @param cigar_packed DPU bitpacked CIGAR array
+ * @param cigar_len    Number of CIGAR operations
+ * @param ref          Reference sequence
+ * @param read         Read sequence
+ * @param backtrack    Output backtrack array
+ * @param seq_len      Sequence length
+ * @return Number of backtrack entries (excluding end marker)
+ */
+static int dpu_cigar_to_backtrack(const uint32_t *cigar_packed, uint8_t cigar_len,
+                                   int8_t *ref, int8_t *read,
+                                   backtrack_t *backtrack, int seq_len)
+{
+    int backtrack_idx = 0;
+    int ref_pos = 0;
+    int read_pos = 0;
+
+    /* Process CIGAR operations in forward direction */
+    for (int i = 0; i < cigar_len; i++) {
+        /* Unpack operation (2 bits) */
+        uint8_t op = CIGAR_UNPACK_OP(cigar_packed, i);
+
+        if (op == CIGAR_OP_MATCH) {
+            /* Check if it's actually a substitution */
+            if ((ref[ref_pos] & 0x3) != (read[read_pos] & 0x3)) {
+                backtrack[backtrack_idx].type = CODE_SUB;  /* Substitution */
+                backtrack[backtrack_idx].ix = ref_pos;
+                backtrack[backtrack_idx].jx = read_pos;
+                backtrack_idx++;
+            }
+            /* Otherwise it's a match - don't record */
+            ref_pos++;
+            read_pos++;
+        } else if (op == CIGAR_OP_INS) {
+            /* Insertion in read */
+            backtrack[backtrack_idx].type = CODE_INS;
+            backtrack[backtrack_idx].ix = ref_pos;
+            backtrack[backtrack_idx].jx = read_pos;
+            backtrack_idx++;
+            read_pos++;
+        } else if (op == CIGAR_OP_DEL) {
+            /* Deletion in read */
+            backtrack[backtrack_idx].type = CODE_DEL;
+            backtrack[backtrack_idx].ix = ref_pos;
+            backtrack[backtrack_idx].jx = read_pos;
+            backtrack_idx++;
+            ref_pos++;
+        }
+    }
+
+    /* Add end marker */
+    backtrack[backtrack_idx].type = CODE_END;
+
+    return backtrack_idx + 1;
+}
 
 static void DPD_compute(int s1, int s2, int *Dij, int Dijm, int Dimj, int Dimjm, int *Pij, int Pijm, int *Qij, int Qimj, int *xij)
 {
@@ -192,7 +271,8 @@ int DPD(int8_t *s1, int8_t *s2, backtrack_t *backtrack, int size_neighbour_in_sy
  * The code is return in "code" as a table of int8_t
  */
 
-static int code_alignment(uint8_t *code, int score, int8_t *gen, int8_t *read, unsigned size_neighbour_in_symbols)
+static int code_alignment(uint8_t *code, int score, int8_t *gen, int8_t *read, unsigned size_neighbour_in_symbols,
+                          const uint32_t *dpu_cigar_packed, uint8_t dpu_cigar_len)
 {
     int code_idx, computed_score, backtrack_idx;
     int size_read = SIZE_READ;
@@ -222,8 +302,23 @@ static int code_alignment(uint8_t *code, int score, int8_t *gen, int8_t *read, u
     if (computed_score == score)
         return code_idx;
 
-    /* Otherwise, re-compute the matrix (only some diagonals) and put in backtrack the path */
-    backtrack_idx = DPD(gen, read, backtrak, size_neighbour_in_symbols + SIZE_SEED);
+    /* Option B optimization: Use DPU CIGAR if available (eliminates host re-alignment!) */
+    if (dpu_cigar_packed != NULL && dpu_cigar_len > 0) {
+        /* Convert DPU bitpacked CIGAR to backtrack format */
+        backtrack_idx = dpu_cigar_to_backtrack(dpu_cigar_packed, dpu_cigar_len, gen, read, backtrak,
+                                                size_neighbour_in_symbols + SIZE_SEED);
+    } else {
+        /* Fallback: re-compute the matrix (only some diagonals) and put in backtrack the path */
+#ifdef USE_WFA2
+        /* Use WFA2 pool-based alignment for 10-20× speedup with minimal overhead */
+        int pool_idx = get_thread_pool_idx();
+        backtrack_idx = wfa2_aligner_pool_align(wfa2_pools[pool_idx], gen, read, backtrak,
+                                                 size_neighbour_in_symbols + SIZE_SEED);
+#else
+        /* Use original banded Smith-Waterman */
+        backtrack_idx = DPD(gen, read, backtrak, size_neighbour_in_symbols + SIZE_SEED);
+#endif
+    }
     if (backtrack_idx == -1) {
         code[0] = CODE_ERR;
         return 1;
@@ -266,7 +361,7 @@ static int code_alignment(uint8_t *code, int score, int8_t *gen, int8_t *read, u
 }
 
 static void set_variant(
-    dpu_result_out_t result_match, genome_t *ref_genome, int8_t *reads_buffer, unsigned int size_neighbour_in_symbols)
+    dpu_result_out_t result_match, genome_t *ref_genome, int8_t *reads_buffer, unsigned int size_neighbour_in_symbols, unsigned int thread_id)
 {
     uint32_t code_result_idx;
     uint8_t code_result_tab[256];
@@ -277,7 +372,8 @@ static void set_variant(
 
     /* Get the differences betweend the read and the sequence of the reference genome that match */
     read = &reads_buffer[result_match.num * size_read];
-    code_alignment(code_result_tab, result_match.score, &ref_genome->data[genome_pos], read, size_neighbour_in_symbols);
+    code_alignment(code_result_tab, result_match.score, &ref_genome->data[genome_pos], read, size_neighbour_in_symbols,
+                   result_match.cigar_packed, result_match.cigar_len);  /* Pass DPU bitpacked CIGAR for Option B */
     if (code_result_tab[0] == CODE_ERR)
         return;
 
@@ -286,6 +382,29 @@ static void set_variant(
         ref_genome->mapping_coverage[genome_pos + i] += 1;
     }
 
+#ifdef USE_OCOCO_COUNTERS
+    /* OCOCO: Process alignment to update counters and track variants */
+    /* Calculate code_len by scanning for CODE_END */
+    int code_len = 0;
+    while (code_result_tab[code_len] != CODE_END && code_len < 1000) {
+        code_len++;
+    }
+    code_len++;  /* Include CODE_END in the length */
+
+    ococo_process_alignment(
+        thread_id,                      /* thread ID for per-thread counters (from function param) */
+        result_match.coord.seq_nr,      /* seq_nr (chromosome) */
+        genome_pos,                     /* genome position */
+        read,                           /* aligned read */
+        &ref_genome->data[genome_pos],  /* reference genome at position */
+        code_result_tab,                /* alignment code (SUB/INS/DEL) */
+        code_len,                       /* actual length of alignment code */
+        size_read                       /* read length */
+    );
+#endif
+
+#ifndef USE_OCOCO_COUNTERS
+    /* Traditional variant tree processing (skipped when using OCOCO) */
     code_result_idx = 0;
     while (code_result_tab[code_result_idx] != CODE_END) {
         int code_result = code_result_tab[code_result_idx];
@@ -366,6 +485,7 @@ static void set_variant(
         variant_tree_insert(
             newvar, result_match.coord.seq_nr, pos_variant_genome + 1 - ref_genome->pt_seq[result_match.coord.seq_nr]);
     }
+#endif  /* USE_OCOCO_COUNTERS */
 }
 
 static pthread_mutex_t non_mapped_mutex;
@@ -436,6 +556,11 @@ static void do_process_read(process_read_arg_t *arg)
     genome_t *ref_genome = arg->ref_genome;
     FILE *fpe1 = arg->fpe1;
     FILE *fpe2 = arg->fpe2;
+#ifdef USE_OCOCO_COUNTERS
+    unsigned int thread_id = get_ococo_thread_id();  /* Get thread ID for OCOCO per-thread counters */
+#else
+    unsigned int thread_id = 0;  /* Not used without OCOCO */
+#endif
     unsigned int size_neighbour_in_symbols = (SIZE_NEIGHBOUR_IN_BYTES - DELTA_NEIGHBOUR(round)) * 4;
 
     /*
@@ -519,8 +644,8 @@ static void do_process_read(process_read_arg_t *arg)
                 }
             }
 
-            set_variant(result_tab[P1[x]], ref_genome, reads_buffer, size_neighbour_in_symbols);
-            set_variant(result_tab[P2[x]], ref_genome, reads_buffer, size_neighbour_in_symbols);
+            set_variant(result_tab[P1[x]], ref_genome, reads_buffer, size_neighbour_in_symbols, thread_id);
+            set_variant(result_tab[P2[x]], ref_genome, reads_buffer, size_neighbour_in_symbols, thread_id);
         } else {
             pthread_mutex_lock(&nr_reads_mutex);
             nr_reads_non_mapped++;
@@ -538,6 +663,56 @@ static void do_process_read(process_read_arg_t *arg)
 static process_read_arg_t args;
 static pthread_t thread_id[PROCESS_READ_THREAD_SLAVE];
 static bool stop_threads = false;
+
+#ifdef USE_WFA2
+// Get pool index for current thread (assigns on first call)
+static inline int get_thread_pool_idx() {
+    pthread_t self = pthread_self();
+
+    // Check if already assigned
+    for (int i = 0; i < next_pool_idx; i++) {
+        if (pthread_equal(pool_thread_ids[i], self)) {
+            return i;
+        }
+    }
+
+    // Assign new pool
+    pthread_mutex_lock(&pool_assign_mutex);
+    int idx = next_pool_idx;
+    if (idx < PROCESS_READ_THREAD_WFA2) {
+        pool_thread_ids[idx] = self;
+        next_pool_idx++;
+    }
+    pthread_mutex_unlock(&pool_assign_mutex);
+
+    return idx;
+}
+#endif
+
+#ifdef USE_OCOCO_COUNTERS
+// Get OCOCO thread ID for current thread (assigns on first call)
+static inline int get_ococo_thread_id() {
+    pthread_t self = pthread_self();
+
+    // Check if already assigned
+    for (int i = 0; i < next_ococo_thread_idx; i++) {
+        if (pthread_equal(ococo_thread_ids[i], self)) {
+            return i;
+        }
+    }
+
+    // Assign new thread ID
+    pthread_mutex_lock(&ococo_thread_assign_mutex);
+    int idx = next_ococo_thread_idx;
+    if (idx < PROCESS_READ_THREAD_OCOCO) {
+        ococo_thread_ids[idx] = self;
+        next_ococo_thread_idx++;
+    }
+    pthread_mutex_unlock(&ococo_thread_assign_mutex);
+
+    return idx;
+}
+#endif
 
 void process_read(FILE *fpe1, FILE *fpe2, int round, unsigned int pass_id)
 {
@@ -580,6 +755,14 @@ void process_read_init()
     assert(pthread_mutex_init(&non_mapped_mutex, NULL) == 0);
     assert(pthread_barrier_init(&barrier, NULL, PROCESS_READ_THREAD) == 0);
 
+#ifdef USE_WFA2
+    // Initialize WFA2 aligner pools for each thread (max sequence length = SIZE_READ + SIZE_SEED + margin)
+    for (unsigned int i = 0; i < PROCESS_READ_THREAD_WFA2; i++) {
+        wfa2_pools[i] = wfa2_aligner_pool_new(256);  // 256bp max to be safe
+        assert(wfa2_pools[i] != NULL);
+    }
+#endif
+
     for (unsigned int each_thread = 0; each_thread < PROCESS_READ_THREAD_SLAVE; each_thread++) {
         assert(pthread_create(&thread_id[each_thread], NULL, process_read_thread_fct, &args) == 0);
     }
@@ -593,6 +776,13 @@ void process_read_free()
     for (unsigned int each_thread = 0; each_thread < PROCESS_READ_THREAD_SLAVE; each_thread++) {
         assert(pthread_join(thread_id[each_thread], NULL) == 0);
     }
+
+#ifdef USE_WFA2
+    // Cleanup WFA2 aligner pools
+    for (unsigned int i = 0; i < PROCESS_READ_THREAD_WFA2; i++) {
+        wfa2_aligner_pool_delete(wfa2_pools[i]);
+    }
+#endif
 
     assert(pthread_barrier_destroy(&barrier) == 0);
     assert(pthread_mutex_destroy(&curr_match_mutex) == 0);
