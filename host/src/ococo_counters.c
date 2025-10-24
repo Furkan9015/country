@@ -481,6 +481,40 @@ void ococo_increment_counter(uint32_t thread_id, uint32_t seq_nr, uint64_t offse
     }
 }
 
+/**
+ * MD TAG OPTIMIZATION: Bulk increment counters for consecutive reference-matching positions
+ * Processes runs of positions more efficiently than individual increments
+ *
+ * @param thread_id Thread ID for per-thread counters
+ * @param seq_nr Chromosome/sequence number
+ * @param start_offset Starting genomic position
+ * @param length Number of consecutive positions to increment
+ * @param ref Reference sequence (2-bit encoding: 0=A, 1=C, 2=T, 3=G)
+ */
+static inline void ococo_increment_counter_bulk(uint32_t thread_id, uint32_t seq_nr,
+                                                 uint64_t start_offset, int length, const int8_t *ref) {
+    if (thread_id >= global_ococo_counters->num_threads) return;
+    if (seq_nr >= global_ococo_counters->nb_seq) return;
+    if (length <= 0) return;
+
+    perthread_dense_array_t *array = &global_ococo_counters->dense_counters[thread_id];
+    uint64_t seq_len = global_ococo_counters->len_seq[seq_nr];
+
+    /* Process consecutive positions */
+    for (int i = 0; i < length; i++) {
+        uint64_t offset = start_offset + i;
+        if (offset >= seq_len || offset >= array->size) break;
+
+        nt4_t ref_nt4 = (nt4_t)(ref[i] & 0x3);
+        if (ref_nt4 >= 4) continue;  /* Skip invalid bases */
+
+        uint8_t *counter = &array->counters[offset].counters[ref_nt4];
+        if (*counter < 255) {
+            (*counter)++;
+        }
+    }
+}
+
 char ococo_call_consensus_position(const pos_stat_uncompressed_t *stats, float threshold) {
     if (stats->sum == 0) {
         /* No coverage, return reference */
@@ -827,16 +861,39 @@ void ococo_process_alignment(
     }
 
 #if defined(OCOCO_LITE_MODE) || defined(OCOCO_BAYESIAN_CALLING)
-    /* Stage 2 Lite / Bayesian: Now increment REF counters for all NON-substitution positions */
+    /* MD TAG OPTIMIZATION: Process REF counter increments in bulk for consecutive runs
+     * This reduces function call overhead and enables better compiler optimization
+     */
+    int run_start = -1;
     for (int i = 0; i < size_read; i++) {
         if (seq_offset + i >= global_ococo_counters->len_seq[seq_nr]) break;
 
-        if (!is_substitution[i]) {  /* Only increment REF if not a substitution */
-            /* FIXED: ref[] uses 2-bit encoding (0=A,1=C,2=T,3=G), not nt16! */
-            nt4_t ref_nt4 = (nt4_t)(ref[i] & 0x3);
-            if (ref_nt4 < 4) {  /* Valid base */
-                ococo_increment_counter(thread_id, seq_nr, seq_offset + i, ref_nt4);
+        if (!is_substitution[i]) {
+            /* Start or continue a reference-matching run */
+            if (run_start == -1) {
+                run_start = i;
             }
+        } else {
+            /* End of run - process bulk increment if we had a run */
+            if (run_start != -1) {
+                int run_length = i - run_start;
+                ococo_increment_counter_bulk(thread_id, seq_nr, seq_offset + run_start,
+                                              run_length, &ref[run_start]);
+                run_start = -1;
+            }
+        }
+    }
+
+    /* Process final run if read ends with reference matches */
+    if (run_start != -1) {
+        int run_length = size_read - run_start;
+        /* Clamp to sequence bounds */
+        if (seq_offset + run_start + run_length > global_ococo_counters->len_seq[seq_nr]) {
+            run_length = global_ococo_counters->len_seq[seq_nr] - (seq_offset + run_start);
+        }
+        if (run_length > 0) {
+            ococo_increment_counter_bulk(thread_id, seq_nr, seq_offset + run_start,
+                                          run_length, &ref[run_start]);
         }
     }
 
